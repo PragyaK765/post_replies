@@ -23,4 +23,5 @@ urlpatterns = [
     path('admin/', admin.site.urls),
     path('', views.home, name='home'),
     re_path(r'^boards/(?P<pk>\d+)/$', views.board_topics, name='board_topics'), #We can use path as well
+    re_path(r'^boards/(?P<pk>\d+)/new/$', views.new_topic, name='new_topic'),
 ]
