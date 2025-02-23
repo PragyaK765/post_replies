@@ -1,6 +1,7 @@
 
 from django import forms
 from .models import Topic
+from .models import Post
 
 class NewTopicForm(forms.ModelForm):
     message = forms.CharField(
@@ -10,14 +11,13 @@ class NewTopicForm(forms.ModelForm):
         max_length=4000,
         help_text='The max length of the text is 4000.'
     )
-    description = forms.CharField(
-        widget=forms.Textarea(
-            attrs={'rows': 5, 'placeholder': 'What is on your mind?'}
-        ),
-        max_length=4000,
-        help_text='The max length of the text is 4000.'
-    )
 
     class Meta:
         model = Topic
-        fields = ['subject', 'message', 'description']
+        fields = ['subject', 'message']
+
+
+class PostForm(forms.ModelForm):
+    class Meta:
+        model = Post
+        fields = ['message', ] #this message is saved in Post database
