@@ -1,4 +1,5 @@
 {% extends 'base.html' %}
+{% load humanize%}
 
 {% block title %}
   {{ board.name }} - {{ block.super }}
@@ -25,16 +26,18 @@
       </tr>
     </thead>
     <tbody>
- 
+      
 {% for topic in topics %}
 <tr>
   <td><a href="{% url 'topic_posts' board.pk topic.pk %}">{{ topic.subject }}</a></td>
   <td>{{ topic.starter.username }}</td>
   <td>{{ topic.replies }}</td>
-  <td>0</td>
-  <td>{{ topic.last_updated }}</td>
+  <td>{{ topic.views }}</td>  <!-- here -->
+  <td>{{ topic.last_updated|naturaltime }}</td>
 </tr>
 {% endfor %}
     </tbody>
   </table>
+
+  {% include 'includes/pagination.html' %}
 {% endblock %}
