@@ -40,6 +40,7 @@ const VideoCall = () => {
   const [peers, setPeers] = useState([]);
   const [connectionStatus, setConnectionStatus] = useState('connecting');
   const [participantCount, setParticipantCount] = useState(1);
+  const [userId, setUserId] = useState(null);
   const remoteVideoRefs = useRef({});
   const peersRef = useRef([]);
 
@@ -55,6 +56,11 @@ const VideoCall = () => {
       result += chars.charAt(Math.floor(Math.random() * chars.length));
     }
     return result;
+  };
+
+  // Generate unique user ID
+  const generateUserId = () => {
+    return `user_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   };
 
   // Purpose from navigation state or default
@@ -111,6 +117,12 @@ const VideoCall = () => {
         }
         
         setConnectionStatus('connected');
+        
+        // Generate user ID after stream is ready
+        const newUserId = generateUserId();
+        setUserId(newUserId);
+        console.log('Generated user ID:', newUserId);
+        
       } catch (err) {
         console.error("getUserMedia error:", err);
         setConnectionStatus('error');
@@ -123,6 +135,10 @@ const VideoCall = () => {
           setStream(audioStream);
           activeStream = audioStream;
           setConnectionStatus('audio-only');
+          
+          const newUserId = generateUserId();
+          setUserId(newUserId);
+          console.log('Generated user ID (audio only):', newUserId);
         } catch (audioErr) {
           console.error("Audio getUserMedia error:", audioErr);
         }
@@ -181,106 +197,160 @@ const VideoCall = () => {
 
   // WebSocket connection and peer management
   useEffect(() => {
-    if (!stream || !roomId) return;
+    if (!stream || !roomId || !userId) return;
 
+    console.log('Initializing WebSocket connection for user:', userId);
     const socket = new WebSocket(`ws://localhost:8000/ws/call/${roomId}/`);
     ws.current = socket;
 
     socket.onopen = () => {
-      console.log('WebSocket connected');
+      console.log('WebSocket connected for user:', userId);
       setConnectionStatus('connected');
-      socket.send(JSON.stringify({ action: "join" }));
+      
+      // Send join message with user ID
+      socket.send(JSON.stringify({ 
+        action: "join",
+        user_id: userId
+      }));
+      
       setTimeout(() => {
-        socket.send(JSON.stringify({ action: "ready" }));
-      }, 500);
+        socket.send(JSON.stringify({ 
+          action: "ready",
+          user_id: userId
+        }));
+      }, 1000);
     };
 
     socket.onmessage = (event) => {
       const data = JSON.parse(event.data);
-      console.log('WebSocket message:', data);
+      console.log('WebSocket message received:', data);
 
       switch (data.action) {
         case "user-joined":
-          setMessages(prev => [...prev, { 
-            text: `${data.peer_id} joined the call`, 
-            from: 'System',
-            timestamp: new Date().toLocaleTimeString()
-          }]);
-          setParticipantCount(prev => prev + 1);
+          console.log('User joined notification:', data.peer_id);
+          if (data.peer_id !== userId) {
+            setMessages(prev => [...prev, { 
+              text: `${data.peer_id} joined the call`, 
+              from: 'System',
+              timestamp: new Date().toLocaleTimeString()
+            }]);
+            setParticipantCount(prev => prev + 1);
+          }
+          break;
+
+        case "existing-users":
+          console.log('Existing users in room:', data.users);
+          // Create peers for existing users
+          if (data.users && Array.isArray(data.users)) {
+            data.users.forEach(existingUserId => {
+              if (existingUserId !== userId) {
+                const alreadyExists = peersRef.current.find(p => p.userId === existingUserId);
+                if (!alreadyExists) {
+                  console.log('Creating peer for existing user:', existingUserId);
+                  const peer = createPeer(existingUserId, true); // We initiate to existing users
+                  if (peer) {
+                    setPeers(prev => [...prev, { peer, userId: existingUserId }]);
+                  }
+                }
+              }
+            });
+          }
           break;
 
         case "new-peer":
         case "initial-peer": {
-          const alreadyExists = peersRef.current.find(p => p.userId === data.peer_id);
-          if (!alreadyExists && stream) {
-            console.log('Creating new peer for:', data.peer_id);
-            const peer = createPeer(data.peer_id, true);
-            if (peer) {
-              setPeers(prev => [...prev, { peer, userId: data.peer_id }]);
+          console.log('New peer event:', data.peer_id);
+          if (data.peer_id !== userId) {
+            const alreadyExists = peersRef.current.find(p => p.userId === data.peer_id);
+            if (!alreadyExists && stream) {
+              console.log('Creating new peer for:', data.peer_id);
+              const peer = createPeer(data.peer_id, true);
+              if (peer) {
+                setPeers(prev => [...prev, { peer, userId: data.peer_id }]);
+              }
             }
           }
           break;
         }
 
         case "offer": {
-          const existingPeer = peersRef.current.find(p => p.userId === data.from);
-          if (!existingPeer && stream) {
-            console.log('Received offer from:', data.from);
-            const peer = createPeer(data.from, false);
-            if (peer) {
-              peer.signal(data.signal);
-              setPeers(prev => [...prev, { peer, userId: data.from }]);
+          console.log('Received offer from:', data.from);
+          if (data.from !== userId) {
+            const existingPeer = peersRef.current.find(p => p.userId === data.from);
+            if (!existingPeer && stream) {
+              console.log('Creating peer to handle offer from:', data.from);
+              const peer = createPeer(data.from, false);
+              if (peer) {
+                peer.signal(data.signal);
+                setPeers(prev => [...prev, { peer, userId: data.from }]);
+              }
+            } else if (existingPeer) {
+              console.log('Signaling existing peer with offer');
+              existingPeer.peer.signal(data.signal);
             }
           }
           break;
         }
 
         case "answer": {
-          const peerItem = peersRef.current.find(p => p.userId === data.from);
-          if (peerItem) {
-            console.log('Received answer from:', data.from);
-            peerItem.peer.signal(data.signal);
+          console.log('Received answer from:', data.from);
+          if (data.from !== userId) {
+            const peerItem = peersRef.current.find(p => p.userId === data.from);
+            if (peerItem) {
+              console.log('Signaling peer with answer');
+              peerItem.peer.signal(data.signal);
+            } else {
+              console.warn('No peer found for answer from:', data.from);
+            }
           }
           break;
         }
 
-        case "candidate": {
-          const peerItem = peersRef.current.find(p => p.userId === data.from);
-          if (peerItem) {
-            console.log('Received ICE candidate from:', data.from);
-            peerItem.peer.signal(data.candidate);
+        case "ice-candidate": {
+          console.log('Received ICE candidate from:', data.from);
+          if (data.from !== userId) {
+            const peerItem = peersRef.current.find(p => p.userId === data.from);
+            if (peerItem) {
+              console.log('Adding ICE candidate to peer');
+              peerItem.peer.signal(data.candidate);
+            }
           }
           break;
         }
 
         case "user-left": {
           console.log('User left:', data.peer_id);
-          setPeers(prev => {
-            const leavingPeer = prev.find(p => p.userId === data.peer_id);
-            if (leavingPeer) {
-              leavingPeer.peer.destroy();
-              // Clean up video ref
-              if (remoteVideoRefs.current[data.peer_id]) {
-                delete remoteVideoRefs.current[data.peer_id];
+          if (data.peer_id !== userId) {
+            setPeers(prev => {
+              const leavingPeer = prev.find(p => p.userId === data.peer_id);
+              if (leavingPeer) {
+                console.log('Destroying peer for leaving user:', data.peer_id);
+                leavingPeer.peer.destroy();
+                // Clean up video ref
+                if (remoteVideoRefs.current[data.peer_id]) {
+                  delete remoteVideoRefs.current[data.peer_id];
+                }
               }
-            }
-            return prev.filter(p => p.userId !== data.peer_id);
-          });
-          setParticipantCount(prev => Math.max(1, prev - 1));
-          setMessages(prev => [...prev, { 
-            text: `${data.peer_id} left the call`, 
-            from: 'System',
-            timestamp: new Date().toLocaleTimeString()
-          }]);
+              return prev.filter(p => p.userId !== data.peer_id);
+            });
+            setParticipantCount(prev => Math.max(1, prev - 1));
+            setMessages(prev => [...prev, { 
+              text: `${data.peer_id} left the call`, 
+              from: 'System',
+              timestamp: new Date().toLocaleTimeString()
+            }]);
+          }
           break;
         }
 
         case "chat-message": {
-          setMessages(prev => [...prev, {
-            text: data.message,
-            from: data.from,
-            timestamp: new Date().toLocaleTimeString()
-          }]);
+          if (data.from !== userId) {
+            setMessages(prev => [...prev, {
+              text: data.message,
+              from: data.from,
+              timestamp: new Date().toLocaleTimeString()
+            }]);
+          }
           break;
         }
 
@@ -300,6 +370,7 @@ const VideoCall = () => {
     };
 
     return () => {
+      console.log('Cleaning up WebSocket connection');
       // Clean up peers
       peersRef.current.forEach(({ peer }) => {
         peer.destroy();
@@ -307,11 +378,14 @@ const VideoCall = () => {
       setPeers([]);
       
       if (socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({ action: "leave" }));
+        socket.send(JSON.stringify({ 
+          action: "leave",
+          user_id: userId
+        }));
       }
       socket.close();
     };
-  }, [stream, roomId]);
+  }, [stream, roomId, userId]);
 
   // Close emoji panel on outside click
   useEffect(() => {
@@ -334,7 +408,7 @@ const VideoCall = () => {
       return null;
     }
 
-    console.log(`Creating peer for ${peerId}, initiator: ${initiator}`);
+    console.log(`Creating peer for ${peerId}, initiator: ${initiator}, my userId: ${userId}`);
     
     const peer = new Peer({
       initiator,
@@ -343,45 +417,62 @@ const VideoCall = () => {
       config: {
         iceServers: [
           { urls: 'stun:stun.l.google.com:19302' },
-          { urls: 'stun:stun1.l.google.com:19302' }
+          { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'stun:stun2.l.google.com:19302' }
         ]
       }
     });
 
     peer.on('signal', signal => {
-      console.log(`Sending ${initiator ? 'offer' : 'answer'} to ${peerId}`);
+      console.log(`Sending ${initiator ? 'offer' : 'answer'} to ${peerId} from ${userId}`);
       if (ws.current && ws.current.readyState === WebSocket.OPEN) {
         ws.current.send(JSON.stringify({
           action: initiator ? 'offer' : 'answer',
           target: peerId,
+          from: userId,
           signal,
         }));
       }
     });
 
     peer.on("stream", (remoteStream) => {
-      console.log("Received stream from", peerId);
-      setTimeout(() => {
+      console.log("🎥 Received remote stream from", peerId);
+      console.log("Stream details:", {
+        id: remoteStream.id,
+        videoTracks: remoteStream.getVideoTracks().length,
+        audioTracks: remoteStream.getAudioTracks().length
+      });
+      
+      // Use requestAnimationFrame to ensure DOM is ready
+      requestAnimationFrame(() => {
         const videoRef = remoteVideoRefs.current[peerId];
         if (videoRef) {
+          console.log("📺 Attaching stream to video element for", peerId);
           videoRef.srcObject = remoteStream;
-          videoRef.play().catch(console.error);
+          videoRef.play().catch(err => {
+            console.error("Error playing remote video:", err);
+          });
         } else {
-          console.warn("No videoRef found for", peerId);
+          console.warn("❌ No videoRef found for", peerId);
+          console.log("Available videoRefs:", Object.keys(remoteVideoRefs.current));
         }
-      }, 100);
+      });
     });
 
     peer.on('connect', () => {
-      console.log('Peer connected:', peerId);
+      console.log('✅ Peer connected:', peerId);
     });
 
     peer.on('error', (err) => {
-      console.error('Peer error:', err);
+      console.error('❌ Peer error for', peerId, ':', err);
     });
 
     peer.on('close', () => {
-      console.log('Peer closed:', peerId);
+      console.log('🔌 Peer closed:', peerId);
+    });
+
+    peer.on('data', (data) => {
+      console.log('📨 Received data from peer:', peerId, data);
     });
 
     return peer;
@@ -396,6 +487,7 @@ const VideoCall = () => {
       if (ws.current && ws.current.readyState === WebSocket.OPEN) {
         ws.current.send(JSON.stringify({
           action: 'audio-toggle',
+          user_id: userId,
           enabled: !micOn
         }));
       }
@@ -411,6 +503,7 @@ const VideoCall = () => {
       if (ws.current && ws.current.readyState === WebSocket.OPEN) {
         ws.current.send(JSON.stringify({
           action: 'video-toggle',
+          user_id: userId,
           enabled: !cameraOn
         }));
       }
@@ -481,6 +574,8 @@ const VideoCall = () => {
   };
 
   const handleLeave = () => {
+    console.log('Leaving call...');
+    
     // Clean up streams
     if (stream) {
       stream.getTracks().forEach(track => track.stop());
@@ -493,7 +588,10 @@ const VideoCall = () => {
     
     // Notify server
     if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-      ws.current.send(JSON.stringify({ action: "leave" }));
+      ws.current.send(JSON.stringify({ 
+        action: "leave",
+        user_id: userId
+      }));
     }
     
     navigate('/user');
@@ -504,7 +602,8 @@ const VideoCall = () => {
       const message = {
         action: 'chat-message',
         message: inputMsg,
-        from: 'You'
+        from: userId,
+        user_id: userId
       };
       
       ws.current.send(JSON.stringify(message));
@@ -527,7 +626,8 @@ const VideoCall = () => {
     if (ws.current && ws.current.readyState === WebSocket.OPEN) {
       ws.current.send(JSON.stringify({
         action: 'emoji-reaction',
-        emoji: emoji
+        emoji: emoji,
+        user_id: userId
       }));
     }
     
@@ -536,13 +636,8 @@ const VideoCall = () => {
     }, 2000);
   };
 
-  const getVideoGridClass = () => {
-    const totalVideos = peers.length + 1; // +1 for local video
-    if (totalVideos === 1) return 'single-video';
-    if (totalVideos === 2) return 'two-videos';
-    if (totalVideos <= 4) return 'four-videos';
-    return 'many-videos';
-  };
+  console.log('Current peers:', peers.map(p => p.userId));
+  console.log('My user ID:', userId);
 
   return (
     <div style={styles.container}>
@@ -556,6 +651,11 @@ const VideoCall = () => {
           <div style={styles.participantCount}>
             {participantCount} participant{participantCount > 1 ? 's' : ''}
           </div>
+          {userId && (
+            <div style={styles.userIdDisplay}>
+              ID: {userId.split('_')[2]}
+            </div>
+          )}
         </div>
         
         <div style={styles.connectionStatus}>
@@ -601,22 +701,45 @@ const VideoCall = () => {
         </div>
 
         {/* Remote videos */}
-        {peers.map(({ userId }) => (
-          <div key={userId} style={styles.videoContainer}>
+        {peers.map(({ userId: peerUserId }) => (
+          <div key={peerUserId} style={styles.videoContainer}>
             <video
               autoPlay
               playsInline
               ref={(el) => {
-                if (el) remoteVideoRefs.current[userId] = el;
+                if (el) {
+                  console.log(`Setting video ref for peer: ${peerUserId}`);
+                  remoteVideoRefs.current[peerUserId] = el;
+                } else {
+                  console.log(`Removing video ref for peer: ${peerUserId}`);
+                  if (remoteVideoRefs.current[peerUserId]) {
+                    delete remoteVideoRefs.current[peerUserId];
+                  }
+                }
               }}
               style={styles.video}
+              onLoadedMetadata={() => {
+                console.log(`Video metadata loaded for ${peerUserId}`);
+              }}
+              onCanPlay={() => {
+                console.log(`Video can play for ${peerUserId}`);
+              }}
             />
             <div style={styles.videoLabel}>
-              <span>{userId}</span>
+              <span>{peerUserId.split('_')[2] || peerUserId}</span>
             </div>
           </div>
         ))}
       </div>
+
+      {/* Debug info */}
+      {process.env.NODE_ENV === 'development' && (
+        <div style={styles.debugInfo}>
+          <div>My ID: {userId}</div>
+          <div>Peers: {peers.length}</div>
+          <div>Peer IDs: {peers.map(p => p.userId.split('_')[2]).join(', ')}</div>
+        </div>
+      )}
 
       {/* Floating emojis */}
       {floatingEmojis.map(({ id, emoji }) => (
@@ -840,6 +963,11 @@ const styles = {
     color: '#9aa0a6',
   },
   
+  userIdDisplay: {
+    fontSize: '10px',
+    color: '#5f6368',
+  },
+  
   connectionStatus: {
     display: 'flex',
     alignItems: 'center',
@@ -911,6 +1039,18 @@ const styles = {
   
   screenShareIcon: {
     fontSize: '12px',
+  },
+  
+  debugInfo: {
+    position: 'absolute',
+    top: '100px',
+    right: '10px',
+    backgroundColor: 'rgba(0,0,0,0.8)',
+    color: '#fff',
+    padding: '10px',
+    borderRadius: '4px',
+    fontSize: '12px',
+    zIndex: 1000,
   },
   
   floatingEmoji: {
