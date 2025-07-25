@@ -25,6 +25,8 @@ const VideoCall = () => {
   const location = useLocation();
   const localVideoRef = useRef(null);
   const emojiPanelRef = useRef(null);
+  const faceRecognitionCanvasRef = useRef(null);
+  const faceRecognitionIntervalRef = useRef(null);
   const { roomId } = useParams();
   const ws = useRef(null);
   const [micOn, setMicOn] = useState(true);
@@ -41,6 +43,14 @@ const VideoCall = () => {
   const [connectionStatus, setConnectionStatus] = useState('connecting');
   const [participantCount, setParticipantCount] = useState(1);
   const [userId, setUserId] = useState(null);
+  
+  // Face recognition states
+  const [faceRecognitionEnabled, setFaceRecognitionEnabled] = useState(false);
+  const [recognizedFaces, setRecognizedFaces] = useState([]);
+  const [faceRecognitionStatus, setFaceRecognitionStatus] = useState('idle'); // idle, processing, error
+  const [lastRecognitionTime, setLastRecognitionTime] = useState(null);
+  const [faceAlerts, setFaceAlerts] = useState([]);
+  
   const remoteVideoRefs = useRef({});
   const peersRef = useRef([]);
 
@@ -98,6 +108,138 @@ const VideoCall = () => {
     }
   };
 
+  // Face Recognition Functions
+  const captureFrameForRecognition = () => {
+    if (!localVideoRef.current || !faceRecognitionCanvasRef.current || !cameraOn) {
+      return null;
+    }
+
+    const video = localVideoRef.current;
+    const canvas = faceRecognitionCanvasRef.current;
+    const ctx = canvas.getContext('2d');
+
+    // Set canvas dimensions to match video
+    canvas.width = video.videoWidth || 640;
+    canvas.height = video.videoHeight || 480;
+
+    // Draw current video frame to canvas
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    // Convert canvas to blob
+    return new Promise((resolve) => {
+      canvas.toBlob((blob) => {
+        resolve(blob);
+      }, 'image/jpeg', 0.8);
+    });
+  };
+
+  const sendFrameForRecognition = async () => {
+    if (faceRecognitionStatus === 'processing') {
+      return; // Don't send if already processing
+    }
+
+    try {
+      setFaceRecognitionStatus('processing');
+      
+      const frameBlob = await captureFrameForRecognition();
+      if (!frameBlob) {
+        setFaceRecognitionStatus('idle');
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append('frame', frameBlob, 'frame.jpg');
+      formData.append('room_id', roomId);
+      formData.append('user_id', userId);
+
+      const accessToken = JSON.parse(localStorage.getItem("user"))?.tokens?.access;
+      const csrfToken = getCookie("csrftoken");
+
+      const response = await axios.post(
+        'http://localhost:8000/api/face-recognition/',
+        formData,
+        {
+          withCredentials: true,
+          headers: {
+            "Authorization": `Bearer ${accessToken}`,
+            "X-CSRFToken": csrfToken,
+            'Content-Type': 'multipart/form-data'
+          },
+          timeout: 10000 // 10 second timeout
+        }
+      );
+
+      if (response.data) {
+        const { recognized_faces, alerts, timestamp } = response.data;
+        
+        if (recognized_faces && recognized_faces.length > 0) {
+          setRecognizedFaces(recognized_faces);
+          setLastRecognitionTime(new Date(timestamp));
+        }
+
+        if (alerts && alerts.length > 0) {
+          setFaceAlerts(prev => [
+            ...prev.slice(-4), // Keep only last 4 alerts
+            ...alerts.map(alert => ({
+              id: Date.now() + Math.random(),
+              message: alert,
+              timestamp: new Date(),
+              type: alert.includes('Unrecognized') ? 'warning' : 'info'
+            }))
+          ]);
+        }
+      }
+
+      setFaceRecognitionStatus('idle');
+    } catch (error) {
+      console.error('Face recognition error:', error);
+      setFaceRecognitionStatus('error');
+      
+      // Reset status after error
+      setTimeout(() => {
+        setFaceRecognitionStatus('idle');
+      }, 5000);
+    }
+  };
+
+  const toggleFaceRecognition = () => {
+    setFaceRecognitionEnabled(prev => {
+      const newState = !prev;
+      
+      if (newState) {
+        // Start face recognition
+        console.log('🔍 Starting face recognition...');
+        faceRecognitionIntervalRef.current = setInterval(() => {
+          sendFrameForRecognition();
+        }, 3000); // Check every 3 seconds
+      } else {
+        // Stop face recognition
+        console.log('🛑 Stopping face recognition...');
+        if (faceRecognitionIntervalRef.current) {
+          clearInterval(faceRecognitionIntervalRef.current);
+          faceRecognitionIntervalRef.current = null;
+        }
+        setRecognizedFaces([]);
+        setFaceRecognitionStatus('idle');
+      }
+      
+      return newState;
+    });
+  };
+
+  // Clear old alerts
+  useEffect(() => {
+    const alertCleanup = setInterval(() => {
+      setFaceAlerts(prev => 
+        prev.filter(alert => 
+          Date.now() - alert.timestamp.getTime() < 30000 // Keep alerts for 30 seconds
+        )
+      );
+    }, 5000);
+
+    return () => clearInterval(alertCleanup);
+  }, []);
+
   // Initialize media stream
   useEffect(() => {
     let activeStream;
@@ -150,6 +292,11 @@ const VideoCall = () => {
     return () => {
       if (activeStream) {
         activeStream.getTracks().forEach(track => track.stop());
+      }
+      
+      // Clean up face recognition
+      if (faceRecognitionIntervalRef.current) {
+        clearInterval(faceRecognitionIntervalRef.current);
       }
     };
   }, []);
@@ -354,6 +501,20 @@ const VideoCall = () => {
           break;
         }
 
+        case "face-alert": {
+          // Handle face recognition alerts from WebSocket
+          setFaceAlerts(prev => [
+            ...prev.slice(-4),
+            {
+              id: Date.now() + Math.random(),
+              message: data.message,
+              timestamp: new Date(),
+              type: data.alert_type || 'info'
+            }
+          ]);
+          break;
+        }
+
         default:
           console.warn("Unknown socket action:", data.action);
       }
@@ -499,6 +660,11 @@ const VideoCall = () => {
       stream.getVideoTracks().forEach(track => (track.enabled = !cameraOn));
       setCameraOn(prev => !prev);
       
+      // If turning off camera, also stop face recognition
+      if (cameraOn && faceRecognitionEnabled) {
+        toggleFaceRecognition();
+      }
+      
       // Notify other participants
       if (ws.current && ws.current.readyState === WebSocket.OPEN) {
         ws.current.send(JSON.stringify({
@@ -519,6 +685,11 @@ const VideoCall = () => {
         });
         
         const videoTrack = screenStream.getVideoTracks()[0];
+        
+        // Stop face recognition when screen sharing
+        if (faceRecognitionEnabled) {
+          toggleFaceRecognition();
+        }
         
         // Replace video track in existing peer connections
         peersRef.current.forEach(({ peer }) => {
@@ -575,6 +746,11 @@ const VideoCall = () => {
 
   const handleLeave = () => {
     console.log('Leaving call...');
+    
+    // Stop face recognition
+    if (faceRecognitionEnabled) {
+      toggleFaceRecognition();
+    }
     
     // Clean up streams
     if (stream) {
@@ -641,6 +817,12 @@ const VideoCall = () => {
 
   return (
     <div style={styles.container}>
+      {/* Hidden canvas for face recognition */}
+      <canvas 
+        ref={faceRecognitionCanvasRef} 
+        style={{ display: 'none' }}
+      />
+
       {/* Header with room info and connection status */}
       <div style={styles.header}>
         <div style={styles.roomInfo}>
@@ -672,6 +854,65 @@ const VideoCall = () => {
         </div>
       </div>
 
+      {/* Face Recognition Panel */}
+      {faceRecognitionEnabled && (
+        <div style={styles.faceRecognitionPanel}>
+          <div style={styles.faceRecognitionHeader}>
+            <span style={styles.faceRecognitionTitle}>🔍 Face Recognition</span>
+            <div style={{
+              ...styles.faceRecognitionStatus,
+              color: faceRecognitionStatus === 'processing' ? '#fbbc04' :
+                     faceRecognitionStatus === 'error' ? '#ea4335' : '#34a853'
+            }}>
+              {faceRecognitionStatus === 'processing' ? 'Processing...' :
+               faceRecognitionStatus === 'error' ? 'Error' : 'Active'}
+            </div>
+          </div>
+          
+          {recognizedFaces.length > 0 && (
+            <div style={styles.recognizedFaces}>
+              <div style={styles.recognizedFacesTitle}>Recognized:</div>
+              {recognizedFaces.map((face, index) => (
+                <div key={index} style={styles.recognizedFace}>
+                  {face}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {lastRecognitionTime && (
+            <div style={styles.lastRecognitionTime}>
+              Last check: {lastRecognitionTime.toLocaleTimeString()}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Face Alerts */}
+      {faceAlerts.length > 0 && (
+        <div style={styles.faceAlertsContainer}>
+          {faceAlerts.map((alert) => (
+            <div 
+              key={alert.id} 
+              style={{
+                ...styles.faceAlert,
+                backgroundColor: alert.type === 'warning' ? '#fff3cd' : '#d1ecf1',
+                borderColor: alert.type === 'warning' ? '#ffeaa7' : '#bee5eb',
+                color: alert.type === 'warning' ? '#856404' : '#0c5460'
+              }}
+            >
+              <span style={styles.alertIcon}>
+                {alert.type === 'warning' ? '⚠️' : 'ℹ️'}
+              </span>
+              <span style={styles.alertMessage}>{alert.message}</span>
+              <span style={styles.alertTime}>
+                {alert.timestamp.toLocaleTimeString()}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* Video Grid */}
       <div style={{
         ...styles.videoGrid,
@@ -696,6 +937,7 @@ const VideoCall = () => {
               {!micOn && <span style={styles.mutedIcon}>🔇</span>}
               {!cameraOn && <span style={styles.cameraOffIcon}>📷</span>}
               {sharingScreen && <span style={styles.screenShareIcon}>🖥️</span>}
+              {faceRecognitionEnabled && <span style={styles.faceRecognitionIcon}>🔍</span>}
             </div>
           </div>
         </div>
@@ -738,6 +980,8 @@ const VideoCall = () => {
           <div>My ID: {userId}</div>
           <div>Peers: {peers.length}</div>
           <div>Peer IDs: {peers.map(p => p.userId.split('_')[2]).join(', ')}</div>
+          <div>Face Recognition: {faceRecognitionEnabled ? 'ON' : 'OFF'}</div>
+          <div>Recognition Status: {faceRecognitionStatus}</div>
         </div>
       )}
 
@@ -792,6 +1036,23 @@ const VideoCall = () => {
           </button>
           <span style={styles.controlLabel}>
             {sharingScreen ? 'Stop sharing' : 'Present now'}
+          </span>
+        </div>
+
+        {/* Face Recognition Toggle */}
+        <div style={styles.controlGroup} onClick={toggleFaceRecognition}>
+          <button style={{
+            ...styles.controlButton,
+            backgroundColor: faceRecognitionEnabled ? '#1a73e8' : '#fff',
+            color: faceRecognitionEnabled ? '#fff' : '#5f6368',
+            opacity: !cameraOn || sharingScreen ? 0.5 : 1
+          }}
+          disabled={!cameraOn || sharingScreen}
+          >
+            🔍
+          </button>
+          <span style={styles.controlLabel}>
+            {faceRecognitionEnabled ? 'Stop Recognition' : 'Face Recognition'}
           </span>
         </div>
 
@@ -900,6 +1161,11 @@ const VideoCall = () => {
           100% { transform: translateY(-120px); opacity: 0; }
         }
         
+        @keyframes slideIn {
+          from { transform: translateX(100%); opacity: 0; }
+          to { transform: translateX(0); opacity: 1; }
+        }
+        
         .single-video {
           grid-template-columns: 1fr !important;
         }
@@ -984,6 +1250,96 @@ const styles = {
     fontSize: '14px',
     color: '#9aa0a6',
   },
+
+  // Face Recognition Styles
+  faceRecognitionPanel: {
+    position: 'absolute',
+    top: '80px',
+    left: '20px',
+    backgroundColor: 'rgba(48, 49, 52, 0.95)',
+    borderRadius: '8px',
+    padding: '12px',
+    minWidth: '200px',
+    zIndex: 1000,
+    border: '1px solid #5f6368',
+  },
+
+  faceRecognitionHeader: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: '8px',
+  },
+
+  faceRecognitionTitle: {
+    fontSize: '14px',
+    fontWeight: '500',
+    color: '#e8eaed',
+  },
+
+  faceRecognitionStatus: {
+    fontSize: '12px',
+    fontWeight: '500',
+  },
+
+  recognizedFaces: {
+    marginBottom: '8px',
+  },
+
+  recognizedFacesTitle: {
+    fontSize: '12px',
+    color: '#9aa0a6',
+    marginBottom: '4px',
+  },
+
+  recognizedFace: {
+    fontSize: '12px',
+    color: '#34a853',
+    backgroundColor: 'rgba(52, 168, 83, 0.1)',
+    padding: '2px 6px',
+    borderRadius: '4px',
+    marginBottom: '2px',
+    display: 'inline-block',
+    marginRight: '4px',
+  },
+
+  lastRecognitionTime: {
+    fontSize: '10px',
+    color: '#5f6368',
+  },
+
+  faceAlertsContainer: {
+    position: 'absolute',
+    top: '80px',
+    right: '20px',
+    maxWidth: '300px',
+    zIndex: 1000,
+  },
+
+  faceAlert: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+    padding: '8px 12px',
+    borderRadius: '6px',
+    marginBottom: '8px',
+    border: '1px solid',
+    animation: 'slideIn 0.3s ease-out',
+    fontSize: '12px',
+  },
+
+  alertIcon: {
+    fontSize: '16px',
+  },
+
+  alertMessage: {
+    flex: 1,
+  },
+
+  alertTime: {
+    fontSize: '10px',
+    opacity: 0.7,
+  },
   
   videoGrid: {
     display: 'grid',
@@ -1039,6 +1395,11 @@ const styles = {
   
   screenShareIcon: {
     fontSize: '12px',
+  },
+
+  faceRecognitionIcon: {
+    fontSize: '12px',
+    color: '#1a73e8',
   },
   
   debugInfo: {
