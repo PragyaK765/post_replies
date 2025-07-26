@@ -29,8 +29,12 @@ const VideoCall = () => {
   const faceRecognitionIntervalRef = useRef(null);
   const { roomId } = useParams();
   const ws = useRef(null);
-  const [micOn, setMicOn] = useState(true);
-  const [cameraOn, setCameraOn] = useState(true);
+  // Get initial settings from PreCallSettings
+  const initialMicOn = location.state?.micOn ?? true;
+  const initialVideoOn = location.state?.videoOn ?? true;
+  
+  const [micOn, setMicOn] = useState(initialMicOn);
+  const [cameraOn, setCameraOn] = useState(initialVideoOn);
   const [sharingScreen, setSharingScreen] = useState(false);
   const [stream, setStream] = useState(null);
   const [showChat, setShowChat] = useState(false);
@@ -403,6 +407,15 @@ const VideoCall = () => {
           audio: true 
         });
         
+        // Apply initial settings from PreCallSettings
+        mediaStream.getAudioTracks().forEach(track => {
+          track.enabled = initialMicOn;
+        });
+        
+        mediaStream.getVideoTracks().forEach(track => {
+          track.enabled = initialVideoOn;
+        });
+        
         setStream(mediaStream);
         activeStream = mediaStream;
         
@@ -416,6 +429,7 @@ const VideoCall = () => {
         const newUserId = generateUserId();
         setUserId(newUserId);
         console.log('Generated user ID:', newUserId);
+        console.log('Applied initial settings - Mic:', initialMicOn, 'Video:', initialVideoOn);
         
       } catch (err) {
         console.error("getUserMedia error:", err);
@@ -426,6 +440,12 @@ const VideoCall = () => {
             video: false, 
             audio: true 
           });
+          
+          // Apply initial mic setting for audio-only mode
+          audioStream.getAudioTracks().forEach(track => {
+            track.enabled = initialMicOn;
+          });
+          
           setStream(audioStream);
           activeStream = audioStream;
           setConnectionStatus('audio-only');
@@ -433,6 +453,7 @@ const VideoCall = () => {
           const newUserId = generateUserId();
           setUserId(newUserId);
           console.log('Generated user ID (audio only):', newUserId);
+          console.log('Applied initial mic setting:', initialMicOn);
         } catch (audioErr) {
           console.error("Audio getUserMedia error:", audioErr);
         }
@@ -451,7 +472,7 @@ const VideoCall = () => {
         clearInterval(faceRecognitionIntervalRef.current);
       }
     };
-  }, []);
+  }, [initialMicOn, initialVideoOn]);
 
   // Room initialization
   useEffect(() => {
